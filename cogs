@@ -1,0 +1,888 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+import json
+import os
+from datetime import datetime
+
+CONFIG_FILE = "logs_config.json"
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        return {}
+    with open(CONFIG_FILE, "r") as f:
+        return json.load(f)
+
+def save_config(data):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def get_log_channel(config, guild_id, log_type):
+    """Retourne l'ID du salon de log pour un type donné, ou le salon général."""
+    guild_cfg = config.get(str(guild_id), {})
+    return guild_cfg.get(log_type) or guild_cfg.get("general")
+
+LOG_TYPES = ["general", "messages", "membres", "moderation", "vocal", "serveur"]
+
+
+class Logs(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    async def send_log(self, guild, log_type, embed):
+        config = load_config()
+        channel_id = get_log_channel(config, guild.id, log_type)
+        if not channel_id:
+            return
+        channel = guild.get_channel(int(channel_id))
+        if channel:
+            try:
+                await channel.send(embed=embed)
+            except Exception:
+                pass
+
+    # ── Commande de configuration ─────────────────────────────────────────────
+    @app_commands.command(name="setlog", description="Définir un salon de logs")
+    @app_commands.describe(type_log="Type de log", salon="Salon de destination")
+    @app_commands.choices(type_log=[
+        app_commands.Choice(name=t, value=t) for t in LOG_TYPES
+    ])
+    @app_commands.default_permissions(administrator=True)
+    async def setlog(self, interaction: discord.Interaction, type_log: str, salon: discord.TextChannel):
+        config = load_config()
+        guild_id = str(interaction.guild.id)
+        if guild_id not in config:
+            config[guild_id] = {}
+        config[guild_id][type_log] = str(salon.id)
+        save_config(config)
+        e = discord.Embed(
+            title="✅ Salon de logs configuré",
+            description=f"Les logs **{type_log}** seront envoyés dans {salon.mention}",
+            color=0x2ECC71
+        )
+        await interaction.response.send_message(embed=e)
+
+    @app_commands.command(name="logliste", description="Voir la configuration des logs")
+    @app_commands.default_permissions(administrator=True)
+    async def logliste(self, interaction: discord.Interaction):
+        config = load_config()
+        guild_cfg = config.get(str(interaction.guild.id), {})
+        if not guild_cfg:
+            return await interaction.response.send_message("Aucun salon de logs configuré. Utilise `/setlog`.", ephemeral=True)
+        e = discord.Embed(title="📋 Configuration des logs", color=0x3498DB)
+        for k, v in guild_cfg.items():
+            ch = interaction.guild.get_channel(int(v))
+            e.add_field(name=k, value=ch.mention if ch else f"Salon introuvable ({v})", inline=True)
+        await interaction.response.send_message(embed=e)
+
+    # ── Messages ──────────────────────────────────────────────────────────────
+    @commands.Cog.listener()
+    async def on_message_delete(self, message):
+        if message.author.bot or not message.guild:
+            return
+        e = discord.Embed(title="🗑️ Message supprimé", color=0xE74C3C, timestamp=datetime.utcnow())
+        e.add_field(name="Auteur", value=f"{message.author.mention} ({message.author})", inline=True)
+        e.add_field(name="Salon", value=message.channel.mention, inline=True)
+        e.add_field(name="Contenu", value=message.content[:1024] or "*Aucun texte*", inline=False)
+        e.set_footer(text=f"ID: {message.author.id}")
+        await self.send_log(message.guild, "messages", e)
+
+    @commands.Cog.listener()
+    async def on_message_edit(self, before, after):
+        if before.author.bot or not before.guild or before.content == after.content:
+            return
+        e = discord.Embed(title="✏️ Message modifié", color=0xF39C12, timestamp=datetime.utcnow())
+        e.add_field(name="Auteur", value=f"{before.author.mention}", inline=True)
+        e.add_field(name="Salon", value=before.channel.mention, inline=True)
+        e.add_field(name="Avant", value=before.content[:512] or "*vide*", inline=False)
+        e.add_field(name="Après", value=after.content[:512] or "*vide*", inline=False)
+        e.add_field(name="Lien", value=f"[Voir le message]({after.jump_url})", inline=False)
+        e.set_footer(text=f"ID: {before.author.id}")
+        await self.send_log(before.guild, "messages", e)
+
+    # ── Membres ───────────────────────────────────────────────────────────────
+    @commands.Cog.listener()
+    async def on_member_join(self, member):
+        e = discord.Embed(title="📥 Membre rejoint", color=0x2ECC71, timestamp=datetime.utcnow())
+        e.set_thumbnail(url=member.display_avatar.url)
+        e.add_field(name="Membre", value=f"{member.mention} ({member})", inline=True)
+        e.add_field(name="Compte créé le", value=member.created_at.strftime("%d/%m/%Y"), inline=True)
+        e.add_field(name="Membres total", value=str(member.guild.member_count), inline=True)
+        e.set_footer(text=f"ID: {member.id}")
+        await self.send_log(member.guild, "membres", e)
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member):
+        e = discord.Embed(title="📤 Membre parti", color=0xE74C3C, timestamp=datetime.utcnow())
+        e.set_thumbnail(url=member.display_avatar.url)
+        e.add_field(name="Membre", value=f"{member} ({member.id})", inline=True)
+        e.add_field(name="Rejoint le", value=member.joined_at.strftime("%d/%m/%Y") if member.joined_at else "?", inline=True)
+        roles = [r.mention for r in member.roles if r.name != "@everyone"]
+        e.add_field(name="Rôles", value=" ".join(roles) if roles else "Aucun", inline=False)
+        await self.send_log(member.guild, "membres", e)
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before, after):
+        # Changement de pseudo
+        if before.nick != after.nick:
+            e = discord.Embed(title="📝 Pseudo modifié", color=0x3498DB, timestamp=datetime.utcnow())
+            e.add_field(name="Membre", value=after.mention, inline=True)
+            e.add_field(name="Avant", value=before.nick or before.name, inline=True)
+            e.add_field(name="Après", value=after.nick or after.name, inline=True)
+            await self.send_log(after.guild, "membres", e)
+
+        # Changement de rôles
+        added = [r for r in after.roles if r not in before.roles]
+        removed = [r for r in before.roles if r not in after.roles]
+        if added or removed:
+            e = discord.Embed(title="🎭 Rôles modifiés", color=0x9B59B6, timestamp=datetime.utcnow())
+            e.add_field(name="Membre", value=after.mention, inline=False)
+            if added:
+                e.add_field(name="Rôle(s) ajouté(s)", value=" ".join(r.mention for r in added), inline=True)
+            if removed:
+                e.add_field(name="Rôle(s) retiré(s)", value=" ".join(r.mention for r in removed), inline=True)
+            await self.send_log(after.guild, "membres", e)
+
+    # ── Vocal ─────────────────────────────────────────────────────────────────
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member, before, after):
+        if before.channel == after.channel:
+            return
+        if after.channel and not before.channel:
+            e = discord.Embed(title="🔊 Connexion vocale", color=0x2ECC71, timestamp=datetime.utcnow())
+            e.add_field(name="Membre", value=member.mention, inline=True)
+            e.add_field(name="Salon rejoint", value=after.channel.name, inline=True)
+        elif before.channel and not after.channel:
+            e = discord.Embed(title="🔇 Déconnexion vocale", color=0xE74C3C, timestamp=datetime.utcnow())
+            e.add_field(name="Membre", value=member.mention, inline=True)
+            e.add_field(name="Salon quitté", value=before.channel.name, inline=True)
+        else:
+            e = discord.Embed(title="↔️ Changement de salon vocal", color=0xF39C12, timestamp=datetime.utcnow())
+            e.add_field(name="Membre", value=member.mention, inline=True)
+            e.add_field(name="Avant", value=before.channel.name, inline=True)
+            e.add_field(name="Après", value=after.channel.name, inline=True)
+        await self.send_log(member.guild, "vocal", e)
+
+    # ── Serveur ───────────────────────────────────────────────────────────────
+    @commands.Cog.listener()
+    async def on_guild_channel_create(self, channel):
+        e = discord.Embed(title="📁 Salon créé", color=0x2ECC71, timestamp=datetime.utcnow())
+        e.add_field(name="Nom", value=channel.name, inline=True)
+        e.add_field(name="Type", value=str(channel.type), inline=True)
+        await self.send_log(channel.guild, "serveur", e)
+
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, channel):
+        e = discord.Embed(title="🗑️ Salon supprimé", color=0xE74C3C, timestamp=datetime.utcnow())
+        e.add_field(name="Nom", value=channel.name, inline=True)
+        e.add_field(name="Type", value=str(channel.type), inline=True)
+        await self.send_log(channel.guild, "serveur", e)
+
+    @commands.Cog.listener()
+    async def on_guild_role_create(self, role):
+        e = discord.Embed(title="🎭 Rôle créé", color=0x2ECC71, timestamp=datetime.utcnow())
+        e.add_field(name="Nom", value=role.name, inline=True)
+        e.add_field(name="Couleur", value=str(role.color), inline=True)
+        await self.send_log(role.guild, "serveur", e)
+
+    @commands.Cog.listener()
+    async def on_guild_role_delete(self, role):
+        e = discord.Embed(title="🗑️ Rôle supprimé", color=0xE74C3C, timestamp=datetime.utcnow())
+        e.add_field(name="Nom", value=role.name, inline=True)
+        await self.send_log(role.guild, "serveur", e)
+
+    # ── Log des actions de modération (dispatché depuis cogs/moderation.py) ───
+    @commands.Cog.listener()
+    async def on_mod_action(self, guild, action_type, moderator, target, reason):
+        colors = {"BAN": 0xE74C3C, "UNBAN": 0x2ECC71, "KICK": 0xE67E22,
+                  "MUTE": 0xF39C12, "WARN": 0xF1C40F}
+        icons = {"BAN": "🔨", "UNBAN": "✅", "KICK": "👢", "MUTE": "🔇", "WARN": "⚠️"}
+        e = discord.Embed(
+            title=f"{icons.get(action_type, '⚙️')} Action de modération — {action_type}",
+            color=colors.get(action_type, 0x95A5A6),
+            timestamp=datetime.utcnow()
+        )
+        e.add_field(name="Cible", value=f"{target.mention} ({target})", inline=True)
+        e.add_field(name="Modérateur", value=f"{moderator.mention}", inline=True)
+        e.add_field(name="Raison", value=reason, inline=False)
+        e.set_footer(text=f"ID cible: {target.id}")
+        await self.send_log(guild, "moderation", e)
+
+
+async def setup(bot):
+    await bot.add_cog(Logs(bot))
+
+import discord
+from discord.ext import commands
+from discord import app_commands
+import json
+import os
+from datetime import datetime
+
+WARNS_FILE = "warns.json"
+
+def load_warns():
+    if not os.path.exists(WARNS_FILE):
+        return {}
+    with open(WARNS_FILE, "r") as f:
+        return json.load(f)
+
+def save_warns(data):
+    with open(WARNS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def embed_success(title, description):
+    e = discord.Embed(title=f"✅ {title}", description=description, color=0x2ECC71)
+    e.timestamp = datetime.utcnow()
+    return e
+
+def embed_error(description):
+    e = discord.Embed(title="❌ Erreur", description=description, color=0xE74C3C)
+    return e
+
+
+class Moderation(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    # ── /ban ──────────────────────────────────────────────────────────────────
+    @app_commands.command(name="ban", description="Bannir un membre du serveur")
+    @app_commands.describe(membre="Le membre à bannir", raison="Raison du ban")
+    @app_commands.default_permissions(ban_members=True)
+    async def ban(self, interaction: discord.Interaction, membre: discord.Member, raison: str = "Aucune raison fournie"):
+        if membre.top_role >= interaction.user.top_role:
+            return await interaction.response.send_message(embed=embed_error("Tu ne peux pas bannir quelqu'un de rang supérieur ou égal au tien."), ephemeral=True)
+
+        try:
+            await membre.send(embed=discord.Embed(
+                title="🔨 Tu as été banni",
+                description=f"**Serveur :** {interaction.guild.name}\n**Raison :** {raison}\n**Modérateur :** {interaction.user}",
+                color=0xE74C3C
+            ))
+        except Exception:
+            pass
+
+        await membre.ban(reason=f"{raison} | Par {interaction.user}")
+        await interaction.response.send_message(embed=embed_success("Banni", f"**{membre}** a été banni.\n**Raison :** {raison}"))
+
+        # Log
+        self.bot.dispatch("mod_action", interaction.guild, "BAN", interaction.user, membre, raison)
+
+    # ── /unban ────────────────────────────────────────────────────────────────
+    @app_commands.command(name="unban", description="Débannir un utilisateur (ID)")
+    @app_commands.describe(user_id="L'ID Discord de l'utilisateur")
+    @app_commands.default_permissions(ban_members=True)
+    async def unban(self, interaction: discord.Interaction, user_id: str):
+        try:
+            user = await self.bot.fetch_user(int(user_id))
+            await interaction.guild.unban(user)
+            await interaction.response.send_message(embed=embed_success("Débanni", f"**{user}** a été débanni."))
+            self.bot.dispatch("mod_action", interaction.guild, "UNBAN", interaction.user, user, "Débannissement")
+        except Exception as e:
+            await interaction.response.send_message(embed=embed_error(f"Impossible de débannir : {e}"), ephemeral=True)
+
+    # ── /kick ─────────────────────────────────────────────────────────────────
+    @app_commands.command(name="kick", description="Expulser un membre du serveur")
+    @app_commands.describe(membre="Le membre à expulser", raison="Raison du kick")
+    @app_commands.default_permissions(kick_members=True)
+    async def kick(self, interaction: discord.Interaction, membre: discord.Member, raison: str = "Aucune raison fournie"):
+        if membre.top_role >= interaction.user.top_role:
+            return await interaction.response.send_message(embed=embed_error("Tu ne peux pas expulser quelqu'un de rang supérieur ou égal."), ephemeral=True)
+
+        try:
+            await membre.send(embed=discord.Embed(
+                title="👢 Tu as été expulsé",
+                description=f"**Serveur :** {interaction.guild.name}\n**Raison :** {raison}\n**Modérateur :** {interaction.user}",
+                color=0xE67E22
+            ))
+        except Exception:
+            pass
+
+        await membre.kick(reason=f"{raison} | Par {interaction.user}")
+        await interaction.response.send_message(embed=embed_success("Expulsé", f"**{membre}** a été expulsé.\n**Raison :** {raison}"))
+        self.bot.dispatch("mod_action", interaction.guild, "KICK", interaction.user, membre, raison)
+
+    # ── /mute ─────────────────────────────────────────────────────────────────
+    @app_commands.command(name="mute", description="Rendre muet un membre (timeout)")
+    @app_commands.describe(membre="Le membre à muter", duree="Durée en minutes", raison="Raison")
+    @app_commands.default_permissions(moderate_members=True)
+    async def mute(self, interaction: discord.Interaction, membre: discord.Member, duree: int = 10, raison: str = "Aucune raison fournie"):
+        from datetime import timedelta
+        if membre.top_role >= interaction.user.top_role:
+            return await interaction.response.send_message(embed=embed_error("Tu ne peux pas muter quelqu'un de rang supérieur ou égal."), ephemeral=True)
+        await membre.timeout(timedelta(minutes=duree), reason=raison)
+        await interaction.response.send_message(embed=embed_success("Muté", f"**{membre}** est muté pendant **{duree} minute(s)**.\n**Raison :** {raison}"))
+        self.bot.dispatch("mod_action", interaction.guild, "MUTE", interaction.user, membre, f"{raison} ({duree} min)")
+
+    # ── /unmute ───────────────────────────────────────────────────────────────
+    @app_commands.command(name="unmute", description="Retirer le mute d'un membre")
+    @app_commands.describe(membre="Le membre à démuter")
+    @app_commands.default_permissions(moderate_members=True)
+    async def unmute(self, interaction: discord.Interaction, membre: discord.Member):
+        await membre.timeout(None)
+        await interaction.response.send_message(embed=embed_success("Démuté", f"**{membre}** n'est plus muté."))
+
+    # ── /warn ─────────────────────────────────────────────────────────────────
+    @app_commands.command(name="warn", description="Avertir un membre")
+    @app_commands.describe(membre="Le membre à avertir", raison="Raison de l'avertissement")
+    @app_commands.default_permissions(kick_members=True)
+    async def warn(self, interaction: discord.Interaction, membre: discord.Member, raison: str = "Aucune raison fournie"):
+        warns = load_warns()
+        guild_id = str(interaction.guild.id)
+        user_id = str(membre.id)
+
+        if guild_id not in warns:
+            warns[guild_id] = {}
+        if user_id not in warns[guild_id]:
+            warns[guild_id][user_id] = []
+
+        warns[guild_id][user_id].append({
+            "raison": raison,
+            "moderateur": str(interaction.user),
+            "date": datetime.utcnow().isoformat()
+        })
+        save_warns(warns)
+
+        count = len(warns[guild_id][user_id])
+
+        try:
+            await membre.send(embed=discord.Embed(
+                title="⚠️ Tu as reçu un avertissement",
+                description=f"**Serveur :** {interaction.guild.name}\n**Raison :** {raison}\n**Total warns :** {count}",
+                color=0xF39C12
+            ))
+        except Exception:
+            pass
+
+        await interaction.response.send_message(embed=embed_success(
+            "Averti",
+            f"**{membre}** a été averti. (**{count} warn(s)** au total)\n**Raison :** {raison}"
+        ))
+        self.bot.dispatch("mod_action", interaction.guild, "WARN", interaction.user, membre, f"{raison} (warn #{count})")
+
+    # ── /warns ────────────────────────────────────────────────────────────────
+    @app_commands.command(name="warns", description="Voir les avertissements d'un membre")
+    @app_commands.describe(membre="Le membre à vérifier")
+    @app_commands.default_permissions(kick_members=True)
+    async def warns(self, interaction: discord.Interaction, membre: discord.Member):
+        warns = load_warns()
+        guild_id = str(interaction.guild.id)
+        user_id = str(membre.id)
+        user_warns = warns.get(guild_id, {}).get(user_id, [])
+
+        if not user_warns:
+            return await interaction.response.send_message(embed=embed_success("Warns", f"**{membre}** n'a aucun avertissement."))
+
+        e = discord.Embed(title=f"⚠️ Warns de {membre}", color=0xF39C12)
+        for i, w in enumerate(user_warns, 1):
+            e.add_field(
+                name=f"Warn #{i} — {w['date'][:10]}",
+                value=f"**Raison :** {w['raison']}\n**Par :** {w['moderateur']}",
+                inline=False
+            )
+        await interaction.response.send_message(embed=e)
+
+    # ── /clearwarn ────────────────────────────────────────────────────────────
+    @app_commands.command(name="clearwarn", description="Supprimer tous les warns d'un membre")
+    @app_commands.describe(membre="Le membre dont on efface les warns")
+    @app_commands.default_permissions(administrator=True)
+    async def clearwarn(self, interaction: discord.Interaction, membre: discord.Member):
+        warns = load_warns()
+        guild_id = str(interaction.guild.id)
+        user_id = str(membre.id)
+        if guild_id in warns and user_id in warns[guild_id]:
+            warns[guild_id][user_id] = []
+            save_warns(warns)
+        await interaction.response.send_message(embed=embed_success("Warns effacés", f"Les warns de **{membre}** ont été supprimés."))
+
+    # ── /clear ────────────────────────────────────────────────────────────────
+    @app_commands.command(name="clear", description="Supprimer des messages en masse")
+    @app_commands.describe(nombre="Nombre de messages à supprimer (max 100)")
+    @app_commands.default_permissions(manage_messages=True)
+    async def clear(self, interaction: discord.Interaction, nombre: int):
+        if nombre < 1 or nombre > 100:
+            return await interaction.response.send_message(embed=embed_error("Nombre entre 1 et 100."), ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        deleted = await interaction.channel.purge(limit=nombre)
+        await interaction.followup.send(embed=embed_success("Messages supprimés", f"**{len(deleted)}** messages supprimés."), ephemeral=True)
+
+
+async def setup(bot):
+    await bot.add_cog(Moderation(bot))
+
+import discord
+from discord.ext import commands
+from discord import app_commands
+import json
+import os
+from datetime import datetime
+
+TICKETS_FILE = "tickets_config.json"
+
+def load_config():
+    if not os.path.exists(TICKETS_FILE):
+        return {}
+    with open(TICKETS_FILE, "r") as f:
+        return json.load(f)
+
+def save_config(data):
+    with open(TICKETS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+# ── Vue persistante du bouton d'ouverture ─────────────────────────────────────
+class TicketOpenView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="📩 Ouvrir un ticket", style=discord.ButtonStyle.blurple, custom_id="ticket:open")
+    async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        config = load_config()
+        guild_cfg = config.get(str(interaction.guild.id), {})
+        category_id = guild_cfg.get("category")
+        staff_role_id = guild_cfg.get("staff_role")
+
+        # Vérifier si un ticket est déjà ouvert
+        for channel in interaction.guild.channels:
+            if (isinstance(channel, discord.TextChannel)
+                    and channel.name == f"ticket-{interaction.user.name.lower().replace(' ', '-')}"
+                    and channel.topic == str(interaction.user.id)):
+                return await interaction.response.send_message(
+                    f"❌ Tu as déjà un ticket ouvert : {channel.mention}", ephemeral=True
+                )
+
+        category = interaction.guild.get_channel(int(category_id)) if category_id else None
+
+        overwrites = {
+            interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True),
+            interaction.guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+        }
+        if staff_role_id:
+            staff_role = interaction.guild.get_role(int(staff_role_id))
+            if staff_role:
+                overwrites[staff_role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+
+        channel = await interaction.guild.create_text_channel(
+            name=f"ticket-{interaction.user.name.lower().replace(' ', '-')}",
+            category=category,
+            topic=str(interaction.user.id),
+            overwrites=overwrites,
+            reason=f"Ticket ouvert par {interaction.user}"
+        )
+
+        e = discord.Embed(
+            title="🎫 Ticket ouvert",
+            description=(
+                f"Bonjour {interaction.user.mention} !\n"
+                "Décris ton problème ci-dessous, un membre du staff te répondra dès que possible.\n\n"
+                "Pour fermer ce ticket, clique sur le bouton ci-dessous."
+            ),
+            color=0x3498DB,
+            timestamp=datetime.utcnow()
+        )
+        e.set_footer(text=interaction.guild.name, icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
+
+        await channel.send(
+            content=f"{interaction.user.mention}" + (f" | <@&{staff_role_id}>" if staff_role_id else ""),
+            embed=e,
+            view=TicketControlView()
+        )
+        await interaction.response.send_message(f"✅ Ton ticket a été créé : {channel.mention}", ephemeral=True)
+
+
+# ── Vue de contrôle dans le ticket ────────────────────────────────────────────
+class TicketControlView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🔒 Fermer le ticket", style=discord.ButtonStyle.red, custom_id="ticket:close")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        config = load_config()
+        guild_cfg = config.get(str(interaction.guild.id), {})
+        staff_role_id = guild_cfg.get("staff_role")
+        logs_channel_id = guild_cfg.get("logs_channel")
+
+        is_staff = False
+        if staff_role_id:
+            role = interaction.guild.get_role(int(staff_role_id))
+            if role and role in interaction.user.roles:
+                is_staff = True
+
+        owner_id = interaction.channel.topic
+        is_owner = str(interaction.user.id) == owner_id
+
+        if not is_staff and not is_owner and not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message("❌ Tu n'as pas la permission de fermer ce ticket.", ephemeral=True)
+
+        await interaction.response.send_message("🔒 Fermeture du ticket dans 5 secondes...", ephemeral=False)
+
+        # Générer la transcription
+        transcript = await self._generate_transcript(interaction.channel)
+
+        # Envoyer la transcription dans le salon de logs
+        if logs_channel_id:
+            logs_ch = interaction.guild.get_channel(int(logs_channel_id))
+            if logs_ch:
+                owner = interaction.guild.get_member(int(owner_id)) if owner_id else None
+                e = discord.Embed(
+                    title=f"📁 Ticket fermé — #{interaction.channel.name}",
+                    description=f"**Fermé par :** {interaction.user.mention}\n**Ouvert par :** {owner.mention if owner else 'Inconnu'}",
+                    color=0xE74C3C,
+                    timestamp=datetime.utcnow()
+                )
+                transcript_file = discord.File(
+                    fp=transcript.encode(),
+                    filename=f"transcript-{interaction.channel.name}.txt"
+                )
+                await logs_ch.send(embed=e, file=transcript_file)
+
+        import asyncio
+        await asyncio.sleep(5)
+        await interaction.channel.delete(reason=f"Ticket fermé par {interaction.user}")
+
+    async def _generate_transcript(self, channel):
+        lines = [f"=== Transcription du ticket #{channel.name} ===\n"]
+        async for msg in channel.history(limit=500, oldest_first=True):
+            lines.append(f"[{msg.created_at.strftime('%d/%m/%Y %H:%M')}] {msg.author}: {msg.content}")
+        return "\n".join(lines)
+
+    @discord.ui.button(label="🔓 Claim", style=discord.ButtonStyle.green, custom_id="ticket:claim")
+    async def claim_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        config = load_config()
+        guild_cfg = config.get(str(interaction.guild.id), {})
+        staff_role_id = guild_cfg.get("staff_role")
+
+        is_staff = interaction.user.guild_permissions.administrator
+        if staff_role_id:
+            role = interaction.guild.get_role(int(staff_role_id))
+            if role and role in interaction.user.roles:
+                is_staff = True
+
+        if not is_staff:
+            return await interaction.response.send_message("❌ Réservé au staff.", ephemeral=True)
+
+        await interaction.channel.edit(topic=f"{interaction.channel.topic} | Géré par {interaction.user}")
+        await interaction.response.send_message(f"✅ {interaction.user.mention} a pris en charge ce ticket.")
+
+
+# ── Cog principal ─────────────────────────────────────────────────────────────
+class Tickets(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        bot.add_view(TicketOpenView())
+        bot.add_view(TicketControlView())
+
+    @app_commands.command(name="ticketsetup", description="Créer le panel de tickets dans ce salon")
+    @app_commands.describe(
+        staff_role="Rôle du staff qui verra les tickets",
+        categorie="Catégorie où créer les tickets",
+        logs="Salon où envoyer les transcriptions"
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def ticketsetup(
+        self,
+        interaction: discord.Interaction,
+        staff_role: discord.Role,
+        categorie: discord.CategoryChannel,
+        logs: discord.TextChannel
+    ):
+        config = load_config()
+        guild_id = str(interaction.guild.id)
+        config[guild_id] = {
+            "staff_role": str(staff_role.id),
+            "category": str(categorie.id),
+            "logs_channel": str(logs.id),
+            "panel_channel": str(interaction.channel.id)
+        }
+        save_config(config)
+
+        e = discord.Embed(
+            title="🎫 Support — Ouvre un ticket",
+            description=(
+                "Tu as besoin d'aide ou tu veux contacter le staff ?\n"
+                "Clique sur le bouton ci-dessous pour ouvrir un ticket privé."
+            ),
+            color=0x3498DB
+        )
+        e.set_footer(text=interaction.guild.name, icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
+        await interaction.channel.send(embed=e, view=TicketOpenView())
+        await interaction.response.send_message("✅ Panel de tickets créé avec succès !", ephemeral=True)
+
+    @app_commands.command(name="ticketstats", description="Voir les stats des tickets")
+    @app_commands.default_permissions(administrator=True)
+    async def ticketstats(self, interaction: discord.Interaction):
+        open_tickets = [
+            c for c in interaction.guild.channels
+            if isinstance(c, discord.TextChannel) and c.name.startswith("ticket-")
+        ]
+        e = discord.Embed(title="🎫 Stats tickets", color=0x3498DB)
+        e.add_field(name="Tickets ouverts", value=str(len(open_tickets)), inline=True)
+        await interaction.response.send_message(embed=e)
+
+
+async def setup(bot):
+    await bot.add_cog(Tickets(bot))
+
+import discord
+from discord.ext import commands
+from discord import app_commands
+from collections import defaultdict
+import json
+import os
+import time
+from datetime import datetime, timedelta
+
+CONFIG_FILE = "antispam_config.json"
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        return {}
+    with open(CONFIG_FILE, "r") as f:
+        return json.load(f)
+
+def save_config(data):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+DEFAULT_CONFIG = {
+    "enabled": True,
+    "max_messages": 5,       # messages max
+    "time_window": 5,        # en secondes
+    "max_mentions": 5,       # mentions max par message
+    "max_lines": 10,          # lignes max par message
+    "mute_duration": 10,     # durée du timeout en minutes
+    "raid_join_window": 10,  # secondes pour détecter un raid
+    "raid_join_threshold": 5 # nouveaux membres en X secondes = raid
+}
+
+
+class AntiSpam(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.message_tracker = defaultdict(list)  # {(guild_id, user_id): [timestamps]}
+        self.join_tracker = defaultdict(list)      # {guild_id: [timestamps]}
+        self.warned_users = set()                  # évite le spam de warnings
+
+    def get_config(self, guild_id):
+        cfg = load_config()
+        guild_cfg = cfg.get(str(guild_id), {})
+        return {**DEFAULT_CONFIG, **guild_cfg}
+
+    # ── Configuration ─────────────────────────────────────────────────────────
+    @app_commands.command(name="antispam", description="Configurer l'anti-spam")
+    @app_commands.describe(
+        max_messages="Messages max avant action (défaut: 5)",
+        time_window="Fenêtre de temps en secondes (défaut: 5)",
+        mute_duration="Durée du mute en minutes (défaut: 10)",
+        actif="Activer ou désactiver"
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def antispam_config(
+        self,
+        interaction: discord.Interaction,
+        max_messages: int = 5,
+        time_window: int = 5,
+        mute_duration: int = 10,
+        actif: bool = True
+    ):
+        config = load_config()
+        guild_id = str(interaction.guild.id)
+        config[guild_id] = {
+            **DEFAULT_CONFIG,
+            **config.get(guild_id, {}),
+            "enabled": actif,
+            "max_messages": max_messages,
+            "time_window": time_window,
+            "mute_duration": mute_duration
+        }
+        save_config(config)
+        status = "✅ activé" if actif else "❌ désactivé"
+        e = discord.Embed(title=f"🛡️ Anti-spam {status}", color=0x2ECC71 if actif else 0xE74C3C)
+        e.add_field(name="Max messages", value=str(max_messages), inline=True)
+        e.add_field(name="Fenêtre", value=f"{time_window}s", inline=True)
+        e.add_field(name="Mute", value=f"{mute_duration} min", inline=True)
+        await interaction.response.send_message(embed=e)
+
+    @app_commands.command(name="antiraid", description="Configurer l'anti-raid")
+    @app_commands.describe(
+        threshold="Nb de membres à rejoindre pour déclencher l'alerte (défaut: 5)",
+        window="Fenêtre de temps en secondes (défaut: 10)"
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def antiraid_config(
+        self,
+        interaction: discord.Interaction,
+        threshold: int = 5,
+        window: int = 10
+    ):
+        config = load_config()
+        guild_id = str(interaction.guild.id)
+        if guild_id not in config:
+            config[guild_id] = dict(DEFAULT_CONFIG)
+        config[guild_id]["raid_join_threshold"] = threshold
+        config[guild_id]["raid_join_window"] = window
+        save_config(config)
+        e = discord.Embed(title="🛡️ Anti-raid configuré", color=0x2ECC71)
+        e.add_field(name="Seuil", value=f"{threshold} membres", inline=True)
+        e.add_field(name="Fenêtre", value=f"{window}s", inline=True)
+        await interaction.response.send_message(embed=e)
+
+    # ── Anti-spam ─────────────────────────────────────────────────────────────
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        if not message.guild or message.author.bot:
+            return
+        if message.author.guild_permissions.administrator:
+            return
+
+        cfg = self.get_config(message.guild.id)
+        if not cfg.get("enabled"):
+            return
+
+        now = time.time()
+        key = (message.guild.id, message.author.id)
+        self.message_tracker[key] = [
+            t for t in self.message_tracker[key]
+            if now - t < cfg["time_window"]
+        ]
+        self.message_tracker[key].append(now)
+
+        infractions = []
+
+        # Flood de messages
+        if len(self.message_tracker[key]) >= cfg["max_messages"]:
+            infractions.append(f"flood ({len(self.message_tracker[key])} msg / {cfg['time_window']}s)")
+            self.message_tracker[key] = []
+
+        # Trop de mentions
+        if len(message.mentions) >= cfg["max_mentions"]:
+            infractions.append(f"masse de mentions ({len(message.mentions)})")
+
+        # Message trop long (anti-mur de texte/ASCII art)
+        if message.content.count("\n") >= cfg["max_lines"]:
+            infractions.append(f"message trop long ({message.content.count(chr(10))} lignes)")
+
+        # Lien d'invitation Discord non autorisé
+        if "discord.gg/" in message.content.lower() or "discord.com/invite/" in message.content.lower():
+            infractions.append("lien d'invitation Discord")
+
+        if infractions:
+            await self._punish(message, cfg, infractions)
+
+    async def _punish(self, message, cfg, infractions):
+        member = message.author
+        reason = "Anti-spam : " + ", ".join(infractions)
+
+        # Supprimer le message
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        # Muter le membre
+        try:
+            await member.timeout(
+                timedelta(minutes=cfg["mute_duration"]),
+                reason=reason
+            )
+        except Exception:
+            pass
+
+        # Avertir dans le salon (une seule fois)
+        if member.id not in self.warned_users:
+            self.warned_users.add(member.id)
+            try:
+                warn_msg = await message.channel.send(
+                    embed=discord.Embed(
+                        title="🛡️ Spam détecté",
+                        description=f"{member.mention} a été muté **{cfg['mute_duration']} minute(s)** pour : {', '.join(infractions)}",
+                        color=0xE74C3C
+                    )
+                )
+                await warn_msg.delete(delay=8)
+            except Exception:
+                pass
+            self.warned_users.discard(member.id)
+
+        # Log
+        self.bot.dispatch(
+            "mod_action",
+            message.guild,
+            "MUTE",
+            message.guild.me,
+            member,
+            reason
+        )
+
+    # ── Anti-raid ─────────────────────────────────────────────────────────────
+    @commands.Cog.listener()
+    async def on_member_join(self, member):
+        cfg = self.get_config(member.guild.id)
+        if not cfg.get("enabled"):
+            return
+
+        now = time.time()
+        gid = member.guild.id
+        self.join_tracker[gid] = [
+            t for t in self.join_tracker[gid]
+            if now - t < cfg["raid_join_window"]
+        ]
+        self.join_tracker[gid].append(now)
+
+        if len(self.join_tracker[gid]) >= cfg["raid_join_threshold"]:
+            await self._handle_raid(member.guild, cfg)
+            self.join_tracker[gid] = []
+
+    async def _handle_raid(self, guild, cfg):
+        # Alerte dans tous les salons où le bot peut écrire
+        e = discord.Embed(
+            title="🚨 RAID DÉTECTÉ",
+            description=(
+                f"**{cfg['raid_join_threshold']} membres** ont rejoint en moins de **{cfg['raid_join_window']} secondes** !\n\n"
+                "⚠️ Les administrateurs doivent agir manuellement (activer le verification level, etc.).\n"
+                "Utilisez `/lockdown` pour verrouiller tous les salons."
+            ),
+            color=0xFF0000,
+            timestamp=datetime.utcnow()
+        )
+        for channel in guild.text_channels:
+            if channel.permissions_for(guild.me).send_messages:
+                try:
+                    await channel.send(
+                        content="@here" if channel.permissions_for(guild.me).mention_everyone else "",
+                        embed=e
+                    )
+                    break
+                except Exception:
+                    continue
+
+        self.bot.dispatch("mod_action", guild, "BAN", guild.me, guild.me, "RAID détecté — alerte envoyée")
+
+    # ── Lockdown ──────────────────────────────────────────────────────────────
+    @app_commands.command(name="lockdown", description="Verrouiller tous les salons (anti-raid)")
+    @app_commands.describe(activer="True pour verrouiller, False pour déverrouiller")
+    @app_commands.default_permissions(administrator=True)
+    async def lockdown(self, interaction: discord.Interaction, activer: bool = True):
+        await interaction.response.defer()
+        count = 0
+        for channel in interaction.guild.text_channels:
+            try:
+                overwrite = channel.overwrites_for(interaction.guild.default_role)
+                overwrite.send_messages = False if activer else None
+                await channel.set_permissions(interaction.guild.default_role, overwrite=overwrite)
+                count += 1
+            except Exception:
+                pass
+
+        action = "verrouillé" if activer else "déverrouillé"
+        e = discord.Embed(
+            title=f"🔒 Lockdown {'activé' if activer else 'désactivé'}",
+            description=f"**{count}** salons ont été {action}s.",
+            color=0xE74C3C if activer else 0x2ECC71
+        )
+        await interaction.followup.send(embed=e)
+
+
+async def setup(bot):
+    await bot.add_cog(AntiSpam(bot))
